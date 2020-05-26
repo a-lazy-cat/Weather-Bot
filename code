@@ -1,0 +1,254 @@
+#!/usr/bin/env python 3.7
+# coding: utf-8
+
+
+import requests
+import datetime
+
+from rasa_nlu.training_data import load_data
+from rasa_nlu.config import RasaNLUModelConfig
+from rasa_nlu.model import Trainer
+from rasa_nlu import config
+
+
+import sqlite3
+import pymysql
+conn = pymysql.connect(host='127.0.0.1', port=3306, user='root', password='passwd', db='world', charset='utf8')
+
+
+trainer = Trainer(config.load("config_spacy.yml"))
+training_data = load_data('training_dataset.json')
+interpreter = trainer.train(training_data)
+
+
+
+
+# Define the INIT state
+INIT = 0
+
+# Define the CHOOSE_CITY state
+CHOOSE_CITY = 1
+
+# Define the ORDERED state
+ORDERED = 2
+
+# Define the CHOOSE_COUONTRY state
+DOING=3
+
+REQUIRE=4
+
+state=INIT
+city_name=''
+response=''
+
+# Define the policy rules
+policy = {
+    (INIT, "none"): (INIT, "I'm sorry - I'm not sure how to help you. Maybe you the city you type is wrong."),
+    (INIT, "specify_city"):(DOING, "please wait for some minutes. I am searching for you now."),
+    #当搜索到存在不止一个结果时，让用户选择
+    (DOING, "more"): (REQUIRE, "The following countries both have the city called {}, choose the certain country"),
+    #询问所在国家时，没有确切回应的情况
+    (REQUIRE,"none"):(INIT, "I'm sorry - I'm not sure how to help you.Maybe you the city you type is wrong."),
+    #当询问所在国家时，如果获得国家名，则进行搜索
+    (REQUIRE,"specify_country"):(DOING, "please wait for some minutes. I am searching for you now."),
+    #查询到结果的时候，返回结果
+    (DOING,"done"):(INIT,"{}"),
+    (DOING, "none"): (INIT, "I'm sorry - no such city is found")
+}
+
+
+
+def get_city_information(city,country,time):
+    city=city+','+country
+    querystring = {"q":city}
+    if(time=='now'):
+        url = "https://community-open-weather-map.p.rapidapi.com/weather"
+    else:
+        #forecast request, return 3-5 day's weather
+        url = "https://community-open-weather-map.p.rapidapi.com/forecast"
+    headers = {
+        'x-rapidapi-host': "community-open-weather-map.p.rapidapi.com",
+        'x-rapidapi-key': "73aa7b13b9mshdbb3aef2134c23ap182210jsn67c233979889"
+        }
+    response = requests.request("GET", url, headers=headers, params=querystring)
+    return response
+
+def get_city_name(message):
+    city_name=interpreter.parse(message)['entities'][0]['value']
+    return city_name
+
+def city_to_countries(city_name):
+    countries=[]
+    c = conn.cursor()
+    c.execute("SELECT cities.state_id FROM cities WHERE cities.name='{}'".format(city_name))
+    states_id=c.fetchall()
+    if(len(states_id)==0):
+        return countries
+    elif(len(states_id)>=1):
+        for k in range(len(states_id)):
+            c.execute("SELECT country_id FROM states WHERE states.id={}".format(states_id[k][0]))
+            country_id=c.fetchall()
+            for i in range(len(country_id)):
+                c.execute("SELECT countries.name FROM countries WHERE countries.id={}".format(country_id[i][0]))
+                country_name=c.fetchall()
+                for j in range(len(country_name)):
+                    countries.append(country_name[j][0])
+    return countries
+
+def iscity(city_name):
+    c = conn.cursor()
+    c.execute("SELECT cities.id FROM cities WHERE cities.name='{}'".format(city_name))
+    search_result=c.fetchall()
+    if(search_result):
+        return True
+    else:
+        return False
+def iscountry(country_name):
+    c = conn.cursor()
+    c.execute("SELECT countries.id FROM countries WHERE countries.name='{}'".format(country_name))
+    search_result=c.fetchall()
+    if(search_result):
+        return True
+    else:
+        return False
+
+#根据获得的国家进行天气数据的搜索
+def get_weather_info(countries_list,city,time):
+    #找不到对应的城市
+    if(len(countries_list)==0):
+        weather_response = 'none'
+    #找到对应的唯一城市
+    elif(len(countries_list)==1):
+        response=get_city_information(city,countries_list[0],time)
+        info_dict=eval(response.text)
+        weather_response="The weather of "+city+" is "+info_dict["weather"][0]["main"]+", to be specific, "+info_dict["weather"][0]["description"]
+        test=". The speed of wind is " + str(info_dict["wind"]["speed"])
+        weather_response+=test
+    #不止一个城市
+    else:
+        weather_response = "more cities"
+    
+    return weather_response,countries_list
+
+
+
+def send_message(state, message,new_response,policy,city_name):
+#     print("USER : {}".format(message))
+    new_state, new_response, weather_info = respond(policy,state, message,city_name)
+    if ("{}" in new_response):
+         print("BOT : {}".format(new_response.format(weather_info)))
+    else:
+        print("BOT : {}".format(new_response))
+    return new_state,new_response
+#没有处理时间
+def respond(policy, state, message,city_name):
+    #判断需要的时国家还是城市
+    if(interpret(message)=='specify_city' and iscity(get_city_name(message))):
+        city_name=get_city_name(message)
+        country_name=city_to_countries(city_name)
+    elif(interpret(message)=='specify_country'and iscountry(get_city_name(message))):
+        country_name=[]
+        country_name_temp=get_city_name(message)
+        country_name.append(country_name_temp)
+    else:
+        return (INIT,"I'm sorry - I'm not sure how to help you. Maybe you the city you type is wrong.","","")
+ 
+
+    time='now'
+    #
+    (new_state, new_response) = policy[(state, interpret(message))]
+
+    #输出请等候
+    if((new_state==DOING and state==INIT) or (new_state==DOING and state==REQUIRE)):
+         print("BOT : {}".format(new_response))
+    weather_info,country_list=get_weather_info(country_name,city_name,time)
+    #判定是否存在多个国家都有同一个名称的城市
+    if(weather_info=="more cities"):
+        (new_state, new_response) = policy[(new_state, "more")]
+        weather_info=",".join(country_list)
+    #找到一个城市天气的情况
+    elif("The speed of wind is" in weather_info):
+        (new_state, new_response) = policy[(new_state, "done")]
+    elif(weather_info=="none"):
+        (new_state, new_response) = policy[(state, "none")]
+        
+    return new_state, new_response,weather_info
+
+#需要修改,自动生成
+def interpret(message):
+    #识别意图
+    msg=interpreter.parse(message)
+    if (len(msg['entities'])==0):
+        return None
+    else:
+        return msg['intent']['name']
+
+
+
+class BotHandler:
+    def __init__(self, token):
+            self.token = token
+            self.api_url = "https://api.telegram.org/bot{}/".format(token)
+
+    #url = "https://api.telegram.org/bot<token>/"
+
+    def get_updates(self, offset=0, timeout=30):
+        method = 'getUpdates'
+        params = {'timeout': timeout, 'offset': offset}
+        resp = requests.get(self.api_url + method, params)
+        result_json = resp.json()['result']
+        return result_json
+
+    def send_message(self, chat_id, text):
+        params = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+        method = 'sendMessage'
+        resp = requests.post(self.api_url + method, params)
+        return resp
+
+    def get_first_update(self):
+        get_result = self.get_updates()
+
+        if len(get_result) > 0:
+            last_update = get_result[0]
+        else:
+            last_update = None
+
+        return last_update
+
+
+token = '1163266283:AAH1TBJmKu4vv07V661O0RBzSMA0w84OGt8' #Token of your bot
+magnito_bot = BotHandler(token) #Your bot's name
+
+
+
+def main():
+    new_offset = 0
+    print('hi, now launching...')
+
+    while True:
+        all_updates=magnito_bot.get_updates(new_offset)
+
+        if len(all_updates) > 0:
+            for current_update in all_updates:
+                # the current_update['message']['text'] is the user sending message
+                first_update_id = current_update['update_id']
+                if 'text' not in current_update['message']:
+                    first_chat_text='New member'
+                else:
+                    first_chat_text = current_update['message']['text']
+                first_chat_id = current_update['message']['chat']['id']
+                
+                message=current_update['message']['text']
+                state,response=send_message(state, message,response,policy,city_name)
+                
+                magnito_bot.send_message(first_chat_id, response)
+                new_offset = first_update_id + 1
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        exit()
+
+
+
